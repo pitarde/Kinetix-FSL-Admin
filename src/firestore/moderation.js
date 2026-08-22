@@ -234,14 +234,24 @@ export async function deleteAccountData(uid, admin, { label = '', reason = '' } 
     catch (e) { result.errors.push('profile: ' + e.message) }
   }
 
-  // 6. Block sign-in (stands in for removing the Auth record).
-  await setDoc(doc(db, 'accountStatus', uid), {
-    disabled: true,
-    lockedUntil: null,
-    reason: reason || 'Account removed by an administrator.',
-    updatedBy: admin?.email || admin?.uid || '',
-    updatedAt: serverTimestamp(),
-  }, { merge: true })
+  // 6. FREE the account (don't ban it), and stamp a wipe marker. Writing the
+  //    doc WITHOUT merge overwrites any prior disable/penalty, so there is no
+  //    block — the person can sign in again and start fresh. `wipedAt` is read
+  //    by the app on next sign-in to also clear the on-device cache, so the
+  //    reset holds even on the same phone. (No `disabled`/`lockedUntil` here,
+  //    so this marker never blocks login.)
+  try {
+    await setDoc(doc(db, 'accountStatus', uid), {
+      wipedAt: serverTimestamp(),
+      reason: reason || 'Account data removed by an administrator.',
+      updatedBy: admin?.email || admin?.uid || '',
+      updatedAt: serverTimestamp(),
+    })
+  } catch (e) { result.errors.push('accountStatus: ' + e.message) }
+
+  // 7. Leave a single note so the person learns why, next time they sign in.
+  await notifyUser(uid, admin,
+    `Your account data was removed by a moderator${reason ? ` (reason: ${reason})` : ''}. You can keep using the app, but you're starting over from scratch.`)
 
   await writeAudit(admin, {
     action: 'account.delete',

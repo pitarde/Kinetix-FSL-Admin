@@ -371,16 +371,16 @@ function ManageUserModal({ learner, status, onClose }) {
 
         {confirm === 'delete' && (
           <ConfirmBlock
-            text="Delete this learner's account? This wipes everything — posts, comments, communities they created, progress, and their profile — exactly like the app's own Delete Account, and blocks sign-in. This cannot be undone."
-            note="Note: without a Cloud Function, the Firebase Auth record itself can't be removed from here, so the account is also disabled to fully block access. The reason above is shown to the user at sign-in."
-            confirmLabel="Delete everything"
+            text="Delete this learner's account data? This wipes everything — posts, comments, communities they created, progress, and their profile — exactly like the app's own Delete Account. This cannot be undone."
+            note="The person is NOT banned: they can sign in again with the same account and start over from scratch, with all old data gone. Use Disable instead if you want to block them entirely."
+            confirmLabel="Delete all data"
             busy={busy}
             disabled={!reason}
             onCancel={() => setConfirm(null)}
             onConfirm={() => run(async () => {
               const r = await deleteAccountData(learner.uid, admin, { reason, label })
               if (r.errors.length) throw new Error(`Partial: ${r.errors.join('; ')}`)
-            }, 'Account fully deleted & sign-in blocked')}
+            }, 'Account data wiped — the account is free to use again')}
           />
         )}
       </div>

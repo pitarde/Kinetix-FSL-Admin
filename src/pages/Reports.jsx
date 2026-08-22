@@ -290,11 +290,11 @@ function ReportGroupCard({ group }) {
             }, `Account data deleted & ${num(group.count)} report${group.count === 1 ? '' : 's'} resolved`)}>Delete everything</Btn>
         </>}>
         <p className="text-sm text-slate-600 dark:text-slate-300 mb-3">
-          Wipes {report.reportedUserName}'s posts, comments, communities, progress and profile — like the app's own Delete Account — and blocks sign-in. This cannot be undone.
+          Wipes {report.reportedUserName}'s posts, comments, communities, progress and profile — like the app's own Delete Account. This cannot be undone.
         </p>
         <ReasonSelect presets={REASON_PRESETS.delete} value={reason} onChange={setReason} />
         <p className="text-xs text-slate-400 dark:text-slate-500 mt-2">
-          Note: the Firebase Auth record can't be removed without a Cloud Function, so the account is disabled to fully block access. The reason is shown to the user at sign-in.
+          The person is not banned — they can sign in again and start over with no old data. Use Disable to block them entirely.
         </p>
       </Modal>
     </Card>
