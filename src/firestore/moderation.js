@@ -125,7 +125,7 @@ export async function dismissReportGroup(reportIds, admin, note = '') {
   })
 }
 
-// ── Account status (disable / time-penalty / re-enable) ─────────────────────
+// ── Account status (disable / time-penalty / unrestrict) ────────────────────
 
 export async function setAccountStatus(uid, status, admin, { reason = '', label = '' } = {}) {
   await setDoc(doc(db, 'accountStatus', uid), {
@@ -157,7 +157,7 @@ export async function disableAccount(uid, admin, opts = {}) {
 
 export async function enableAccount(uid, admin, opts = {}) {
   await setAccountStatus(uid, { disabled: false, lockedUntil: null }, admin, opts)
-  await notifyUser(uid, admin, 'Your account has been re-enabled. Welcome back!')
+  await notifyUser(uid, admin, 'Your account has been unrestricted. Welcome back!')
 }
 
 /** Lock sign-in for [hours] from now (a time penalty). */
