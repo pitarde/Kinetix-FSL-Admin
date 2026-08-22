@@ -1,0 +1,15 @@
+{
+  "projects": {
+    "default": "kinetixfsl-73d88"
+  },
+  "targets": {
+    "kinetixfsl-73d88": {
+      "hosting": {
+        "admin": [
+          "kinetix-fsl-admin"
+        ]
+      }
+    }
+  },
+  "etags": {}
+}
