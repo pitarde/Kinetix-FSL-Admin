@@ -225,7 +225,7 @@ function ReportGroupCard({ group }) {
           )}
           <Btn variant="danger" size="sm" disabled={busy} onClick={() => { setReason(''); setAction('disable') }}>Disable user</Btn>
           <Btn variant="warn" size="sm" disabled={busy} onClick={() => { setReason(''); setAction('penalize') }}>Penalize user</Btn>
-          <Btn variant="danger" size="sm" disabled={busy} onClick={() => { setReason(''); setAction('deleteUser') }}>Delete user</Btn>
+          <Btn variant="danger" size="sm" disabled={busy} onClick={() => { setReason(''); setAction('deleteUser') }}>Delete Account</Btn>
           <Btn variant="outline" size="sm" disabled={busy}
             onClick={() => act(() => resolveReportGroup(reportIds, admin, { actionTaken: 'Reviewed — no action' }),
               `${num(group.count)} report${group.count === 1 ? '' : 's'} marked resolved`)}>
@@ -287,7 +287,7 @@ function ReportGroupCard({ group }) {
               const r = await deleteAccountData(report.reportedUserId, admin, { reason, label: report.reportedUserName })
               await resolveReportGroup(reportIds, admin, { actionTaken: 'Account deleted' })
               if (r.errors.length) throw new Error(`Partial: ${r.errors.join('; ')}`)
-            }, `Account data deleted & ${num(group.count)} report${group.count === 1 ? '' : 's'} resolved`)}>Delete everything</Btn>
+            }, `Account data deleted & ${num(group.count)} report${group.count === 1 ? '' : 's'} resolved`)}>Delete Account</Btn>
         </>}>
         <p className="text-sm text-slate-600 dark:text-slate-300 mb-3">
           Wipes {report.reportedUserName}'s posts, comments, communities, progress and profile — like the app's own Delete Account. This cannot be undone.

@@ -224,10 +224,18 @@ export async function deleteAccountData(uid, admin, { label = '', reason = '' } 
   try { await deleteDoc(doc(db, 'progress', uid)) }
   catch (e) { result.errors.push('progress: ' + e.message) }
 
-  // 5. Public profile — delete, falling back to anonymise if the delete is
-  //    blocked for any reason.
+  // 5. Every subcollection under the user (browsing history, follow graph,
+  //    joined/hidden/blocked lists, devices), then the profile doc itself.
+  //    "Delete everything" means none of this survives to reappear on re-login
+  //    (e.g. Recently Visited communities in the drawer).
+  for (const sub of [
+    'joinedCommunities', 'recentCommunities', 'followers', 'following',
+    'hiddenPosts', 'blocked', 'blockedBy', 'devices',
+  ]) {
+    try { await deleteAll(collection(db, 'users', uid, sub)) }
+    catch (e) { result.errors.push(`${sub}: ${e.message}`) }
+  }
   try {
-    await deleteAll(collection(db, 'users', uid, 'joinedCommunities'))
     await deleteDoc(doc(db, 'users', uid))
   } catch {
     try { await setDoc(doc(db, 'users', uid), { displayName: 'Deleted user', avatarUrl: null }, { merge: true }) }
@@ -243,6 +251,11 @@ export async function deleteAccountData(uid, admin, { label = '', reason = '' } 
   try {
     await setDoc(doc(db, 'accountStatus', uid), {
       wipedAt: serverTimestamp(),
+      // The app self-deletes its own Firebase Auth record on the next sign-in
+      // when it sees this flag (a user may always delete their own account —
+      // the same free path the in-app Settings "Delete account" uses). No
+      // Admin SDK / Cloud Function / Blaze needed.
+      purgeAuth: true,
       reason: reason || 'Account data removed by an administrator.',
       updatedBy: admin?.email || admin?.uid || '',
       updatedAt: serverTimestamp(),
@@ -251,7 +264,7 @@ export async function deleteAccountData(uid, admin, { label = '', reason = '' } 
 
   // 7. Leave a single note so the person learns why, next time they sign in.
   await notifyUser(uid, admin,
-    `Your account data was removed by a moderator${reason ? ` (reason: ${reason})` : ''}. You can keep using the app, but you're starting over from scratch.`)
+    `Your account has been deleted by an administrator${reason ? ` (reason: ${reason})` : ''}. As a penalty, all your data has been removed. You may sign in again, but you'll start over from scratch.`)
 
   await writeAudit(admin, {
     action: 'account.delete',

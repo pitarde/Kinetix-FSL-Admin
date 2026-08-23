@@ -328,7 +328,7 @@ function ManageUserModal({ learner, status, onClose }) {
                 <Btn variant="danger" disabled={busy} onClick={() => { setReason(''); setConfirm('disable') }}>Disable account</Btn>
               </>
             )}
-            <Btn variant="danger" disabled={busy} onClick={() => { setReason(''); setConfirm('delete') }}>Delete account</Btn>
+            <Btn variant="danger" disabled={busy} onClick={() => { setReason(''); setConfirm('delete') }}>Delete Account</Btn>
           </div>
         )}
 
@@ -373,7 +373,7 @@ function ManageUserModal({ learner, status, onClose }) {
           <ConfirmBlock
             text="Delete this learner's account data? This wipes everything — posts, comments, communities they created, progress, and their profile — exactly like the app's own Delete Account. This cannot be undone."
             note="The person is NOT banned: they can sign in again with the same account and start over from scratch, with all old data gone. Use Disable instead if you want to block them entirely."
-            confirmLabel="Delete all data"
+            confirmLabel="Delete Account"
             busy={busy}
             disabled={!reason}
             onCancel={() => setConfirm(null)}
