@@ -1,8 +1,9 @@
 import {
-  collection, query, where, orderBy, onSnapshot, getDocs,
-  doc, setDoc, updateDoc, deleteDoc, addDoc, serverTimestamp, Timestamp,
+  collection, collectionGroup, query, where, orderBy, onSnapshot, getDocs, getDoc,
+  doc, setDoc, updateDoc, deleteDoc, addDoc, serverTimestamp, Timestamp, increment,
 } from 'firebase/firestore'
 import { db } from '../firebase'
+import { deleteR2Objects, storageKeyOf, postStorageKeys } from '../lib/r2'
 
 // Default reason choices, so an admin can pick a standard reason instead of
 // typing one every time (they can still add a custom note). These strings are
@@ -173,14 +174,22 @@ export async function penalizeAccount(uid, hours, admin, opts = {}) {
 // ── Server-side (admin-triggered) account deletion ──────────────────────────
 //
 // The direct-SDK equivalent of the app's AccountEraser, run by an admin against
-// someone else's uid. It wipes the learner's Firestore footprint (posts +
-// their comment/vote/share subtrees, communities they created + every post
-// inside, notifications, progress, and their public profile).
+// someone else's uid. Wipes the learner's whole footprint:
+//   • their posts (+ comment/vote/share subtrees) and the R2 media on them
+//   • communities they created (+ every post inside, members, and R2 avatar/banner)
+//   • comments and votes they left on OTHER people's posts, correcting each
+//     post's commentCount / upvoteCount / downvoteCount / score
+//   • their memberships (memberCount fixed) and their follow edges in both
+//     directions (follower/following counts fixed)
+//   • direct messages they sent (+ chat media in R2), and any thread whose
+//     other participant is also gone
+//   • notifications, progress, every users/{uid} subcollection, and the
+//     public profile doc (+ its R2 avatar/banner)
 //
-// IMPORTANT LIMITATION: with no Cloud Function / Admin SDK in this deployment,
-// the Firebase *Auth* record itself cannot be removed from here. So this also
-// marks the account disabled, which is what actually stops the person using the
-// app (AuthRepository refuses a disabled sign-in). Surface that in the UI.
+// IMPORTANT LIMITATION: with no Cloud Function / Admin SDK here, the Firebase
+// *Auth* record can't be removed from the console. Step 6 writes a `purgeAuth`
+// marker that the app acts on at next sign-in (a user may always delete their
+// own Auth record — the free path). The account is left un-banned.
 
 async function deleteAll(q) {
   const snap = await getDocs(q)
@@ -188,7 +197,24 @@ async function deleteAll(q) {
   return snap.size
 }
 
-async function deletePostTree(postRef) {
+// Free a post's R2 media (its own files + any image on its comments) while the
+// documents still exist — the Worker verifies each key against them — then take
+// the comment/vote/share subtree and the post itself down.
+async function deletePostTree(postRef, result = { r2: 0, errors: [] }) {
+  try {
+    const [postSnap, commentsSnap] = await Promise.all([
+      getDoc(postRef),
+      getDocs(collection(postRef, 'comments')),
+    ])
+    const keys = postStorageKeys(
+      postSnap.data() || {},
+      commentsSnap.docs.map((d) => d.data()),
+    )
+    if (keys.length && await deleteR2Objects({ postId: postRef.id }, keys)) {
+      result.r2 += keys.length
+    }
+  } catch (e) { result.errors.push('post media: ' + e.message) }
+
   await deleteAll(collection(postRef, 'comments'))
   await deleteAll(collection(postRef, 'votes'))
   await deleteAll(collection(postRef, 'shares'))
@@ -196,38 +222,147 @@ async function deletePostTree(postRef) {
 }
 
 export async function deleteAccountData(uid, admin, { label = '', reason = '' } = {}) {
-  const result = { posts: 0, communities: 0, errors: [] }
+  const result = {
+    posts: 0, communities: 0, comments: 0, votes: 0,
+    messages: 0, conversations: 0, r2: 0, errors: [],
+  }
 
-  // 1. Their own posts (+ subtrees).
+  // 1. Their own posts (+ subtrees + R2 media).
   try {
     const own = await getDocs(query(collection(db, 'posts'), where('authorId', '==', uid)))
-    for (const p of own.docs) { await deletePostTree(p.ref); result.posts++ }
+    for (const p of own.docs) { await deletePostTree(p.ref, result); result.posts++ }
   } catch (e) { result.errors.push('posts: ' + e.message) }
 
-  // 2. Communities they created (+ every post inside, by any author, + members).
+  // 2. Communities they created (+ every post inside, by any author, + members,
+  //    + the community's own avatar/banner in R2).
   try {
     const comms = await getDocs(query(collection(db, 'communities'), where('creatorId', '==', uid)))
     for (const c of comms.docs) {
+      const cd = c.data() || {}
+      const cKeys = [cd.avatarUrl, cd.bannerUrl, cd.avatarUrlPrev, cd.bannerUrlPrev]
+        .map(storageKeyOf).filter(Boolean)
+      if (cKeys.length && await deleteR2Objects({ communityId: c.id }, cKeys)) result.r2 += cKeys.length
+
       const inside = await getDocs(query(collection(db, 'posts'), where('communityId', '==', c.id)))
-      for (const p of inside.docs) await deletePostTree(p.ref)
+      for (const p of inside.docs) await deletePostTree(p.ref, result)
       await deleteAll(collection(c.ref, 'members'))
       await deleteDoc(c.ref)
       result.communities++
     }
   } catch (e) { result.errors.push('communities: ' + e.message) }
 
-  // 3. Notifications inbox.
+  // 3. Comments they left on OTHER people's posts. Free any attached image
+  //    (still authorised while the comment exists), delete the comment, and
+  //    drop the surviving post's commentCount by one.
+  try {
+    const cg = await getDocs(query(collectionGroup(db, 'comments'), where('authorId', '==', uid)))
+    for (const cm of cg.docs) {
+      const postRef = cm.ref.parent.parent
+      const imgKey = storageKeyOf(cm.data()?.imageUrl)
+      if (imgKey && postRef && await deleteR2Objects({ postId: postRef.id }, [imgKey])) result.r2++
+      if (postRef) {
+        try { await updateDoc(postRef, { commentCount: increment(-1) }) } catch { /* post gone */ }
+      }
+      await deleteDoc(cm.ref)
+      result.comments++
+    }
+  } catch (e) { result.errors.push('comments-everywhere: ' + e.message) }
+
+  // 4. Votes they cast on OTHER people's posts. Delete each, then RECOUNT the
+  //    post from the votes still under it (same as the app's AccountEraser) so
+  //    a lost decrement can't leave the tally wrong.
+  try {
+    const cg = await getDocs(query(collectionGroup(db, 'votes'), where('userId', '==', uid)))
+    const byPost = new Map()
+    for (const v of cg.docs) {
+      const postRef = v.ref.parent.parent
+      if (postRef) byPost.set(postRef.path, postRef)
+      await deleteDoc(v.ref)
+      result.votes++
+    }
+    for (const postRef of byPost.values()) {
+      try {
+        const left = await getDocs(collection(postRef, 'votes'))
+        let up = 0, down = 0
+        left.forEach((d) => { const dir = d.data()?.direction; if (dir === 'up') up++; else if (dir === 'down') down++ })
+        await updateDoc(postRef, { upvoteCount: up, downvoteCount: down, score: up - down })
+      } catch { /* post gone */ }
+    }
+  } catch (e) { result.errors.push('votes-everywhere: ' + e.message) }
+
+  // 5. Communities they merely joined: drop the member marker and the count.
+  try {
+    const joined = await getDocs(collection(db, 'users', uid, 'joinedCommunities'))
+    for (const j of joined.docs) {
+      const cRef = doc(db, 'communities', j.id)
+      try { await deleteDoc(doc(cRef, 'members', uid)) } catch { /* already gone */ }
+      try { await updateDoc(cRef, { memberCount: increment(-1) }) } catch { /* community gone */ }
+    }
+  } catch (e) { result.errors.push('joined-communities: ' + e.message) }
+
+  // 6. Follow graph, both directions — so no surviving account is left
+  //    following, or listed as followed by, this one.
+  try {
+    const following = await getDocs(collection(db, 'users', uid, 'following'))
+    for (const f of following.docs) {
+      const t = doc(db, 'users', f.id)
+      try { await deleteDoc(doc(t, 'followers', uid)) } catch { /* gone */ }
+      try { await updateDoc(t, { followerCount: increment(-1) }) } catch { /* gone */ }
+    }
+    const followers = await getDocs(collection(db, 'users', uid, 'followers'))
+    for (const f of followers.docs) {
+      const t = doc(db, 'users', f.id)
+      try { await deleteDoc(doc(t, 'following', uid)) } catch { /* gone */ }
+      try { await updateDoc(t, { followingCount: increment(-1) }) } catch { /* gone */ }
+    }
+  } catch (e) { result.errors.push('follow-graph: ' + e.message) }
+
+  // 7. Direct messages. Free chat media from R2, delete the messages this user
+  //    sent, and take the whole thread down when its other participant has also
+  //    deleted their account (a ghost nobody can open).
+  try {
+    const threads = await getDocs(
+      query(collection(db, 'conversations'), where('participants', 'array-contains', uid)),
+    )
+    for (const t of threads.docs) {
+      const parts = Array.isArray(t.data()?.participants) ? t.data().participants : []
+      const otherUid = parts.find((p) => p !== uid)
+      let otherGone = !otherUid
+      if (otherUid) {
+        try { otherGone = !(await getDoc(doc(db, 'users', otherUid))).exists() } catch { otherGone = false }
+      }
+
+      const msgs = await getDocs(collection(t.ref, 'messages'))
+      const toDelete = msgs.docs.filter((m) => otherGone || m.data()?.senderId === uid)
+      const keys = toDelete.flatMap((m) => [
+        storageKeyOf(m.data()?.mediaUrl), storageKeyOf(m.data()?.thumbUrl),
+      ]).filter(Boolean)
+      if (keys.length && await deleteR2Objects({ conversationId: t.id }, keys)) result.r2 += keys.length
+      await Promise.all(toDelete.map((m) => deleteDoc(m.ref)))
+      result.messages += toDelete.length
+
+      if (otherGone) { await deleteDoc(t.ref); result.conversations++ }
+    }
+  } catch (e) { result.errors.push('conversations: ' + e.message) }
+
+  // 8. Notifications inbox.
   try { await deleteAll(collection(db, 'notifications', uid, 'items')) }
   catch (e) { result.errors.push('notifications: ' + e.message) }
 
-  // 4. Progress doc.
+  // 9. Progress doc.
   try { await deleteDoc(doc(db, 'progress', uid)) }
   catch (e) { result.errors.push('progress: ' + e.message) }
 
-  // 5. Every subcollection under the user (browsing history, follow graph,
-  //    joined/hidden/blocked lists, devices), then the profile doc itself.
-  //    "Delete everything" means none of this survives to reappear on re-login
-  //    (e.g. Recently Visited communities in the drawer).
+  // 10. The profile's own avatar/banner in R2 (while users/{uid} still exists),
+  //     then every subcollection under the user, then the profile doc itself.
+  try {
+    const meSnap = await getDoc(doc(db, 'users', uid))
+    const md = meSnap.data() || {}
+    const pKeys = [md.avatarUrl, md.bannerUrl, md.avatarUrlPrev, md.bannerUrlPrev]
+      .map(storageKeyOf).filter(Boolean)
+    if (pKeys.length && await deleteR2Objects({ userId: uid }, pKeys)) result.r2 += pKeys.length
+  } catch (e) { result.errors.push('profile media: ' + e.message) }
+
   for (const sub of [
     'joinedCommunities', 'recentCommunities', 'followers', 'following',
     'hiddenPosts', 'blocked', 'blockedBy', 'devices',
@@ -262,10 +397,10 @@ export async function deleteAccountData(uid, admin, { label = '', reason = '' } 
     })
   } catch (e) { result.errors.push('accountStatus: ' + e.message) }
 
-  // 7. Leave a single note so the person learns why, next time they sign in.
-  await notifyUser(uid, admin,
-    `Your account has been deleted by an administrator${reason ? ` (reason: ${reason})` : ''}. As a penalty, all your data has been removed. You may sign in again, but you'll start over from scratch.`)
-
+  // No learner notification for a delete: it would just re-create the
+  // notifications/{uid} subcollection this wipe cleared in step 8, and the
+  // reason already lives in the audit log below. The app tells the person why
+  // on their next sign-in from `accountStatus/{uid}.reason` anyway.
   await writeAudit(admin, {
     action: 'account.delete',
     targetUserId: uid,

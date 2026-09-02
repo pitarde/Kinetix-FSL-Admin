@@ -371,7 +371,7 @@ function ManageUserModal({ learner, status, onClose }) {
 
         {confirm === 'delete' && (
           <ConfirmBlock
-            text="Delete this learner's account data? This wipes everything — posts, comments, communities they created, progress, and their profile — exactly like the app's own Delete Account. This cannot be undone."
+            text="Delete this learner's account data? This wipes everything — posts, comments and votes (fixing the counts on other people's posts), communities they created, their messages and chat media, progress, follows, and their profile — plus every image and video in Cloudflare R2. Exactly like the app's own Delete Account. This cannot be undone."
             note="The person is NOT banned: they can sign in again with the same account and start over from scratch, with all old data gone. Use Disable instead if you want to block them entirely."
             confirmLabel="Delete Account"
             busy={busy}
