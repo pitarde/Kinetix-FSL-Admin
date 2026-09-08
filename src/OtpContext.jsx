@@ -8,7 +8,17 @@ const OtpContext = createContext(null)
 
 const SESSION_KEY_PREFIX = 'kinetix_otp_verified_'
 
+// OTP is migrating from the root collection otp_codes/{uid} to a subcollection
+// users/{uid}/private/otp (Phase 1 of FIRESTORE_RESTRUCTURE.md). Codes are
+// hashed and expire in minutes, so there is no backfill — we write and read the
+// new path, and only fall back to the old one so a code issued by the previous
+// deployment can still be verified while it drains. Phase 5 removes the fallback.
 function otpDocRef(uid) {
+  return doc(db, 'users', uid, 'private', 'otp')
+}
+
+// OLD PATH (Phase 5: remove).
+function legacyOtpDocRef(uid) {
   return doc(db, 'otp_codes', uid)
 }
 
@@ -43,8 +53,16 @@ export function OtpProvider({ children }) {
   }
 
   async function verifyOtp(user, codeEntered) {
-    const ref = otpDocRef(user.uid)
-    const snap = await getDoc(ref)
+    // Read the new nested path first, then fall back to the old root path for a
+    // code issued by the previous deployment. `ref` tracks whichever holds the
+    // code, so attempt-count updates and the final delete hit the right doc.
+    let ref = otpDocRef(user.uid)
+    let snap = await getDoc(ref)
+    if (!snap.exists()) {
+      const legacyRef = legacyOtpDocRef(user.uid)
+      const legacySnap = await getDoc(legacyRef)
+      if (legacySnap.exists()) { ref = legacyRef; snap = legacySnap }
+    }
 
     if (!snap.exists()) {
       return { ok: false, reason: 'expired' }

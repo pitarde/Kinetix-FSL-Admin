@@ -33,10 +33,13 @@ export const REASON_PRESETS = {
 // Writes an in-app notification into a learner's inbox (the same schema the
 // mobile app renders, type "system"). Best-effort — a failure here must never
 // abort the moderation action that triggered it.
+//
+// Targets the new nested inbox users/{uid}/notifications (Phase 4); the mobile
+// app reads both paths merged, so an updated client sees it.
 export async function notifyUser(uid, admin, message) {
   if (!uid || !message) return
   try {
-    await addDoc(collection(db, 'notifications', uid, 'items'), {
+    await addDoc(collection(db, 'users', uid, 'notifications'), {
       type: 'system',
       fromUserId: admin?.uid || '',
       fromUserName: 'Kinetix Moderation',
@@ -129,12 +132,21 @@ export async function dismissReportGroup(reportIds, admin, note = '') {
 // ── Account status (disable / time-penalty / unrestrict) ────────────────────
 
 export async function setAccountStatus(uid, status, admin, { reason = '', label = '' } = {}) {
-  await setDoc(doc(db, 'accountStatus', uid), {
+  // Account status is migrating from accountStatus/{uid} (old root) to
+  // users/{uid}/status/moderation (new nested). Dual-write both during Phase 2
+  // so mobile clients reading either path enforce the disable/penalty. Both
+  // reads are new-first with an old fallback, so this is version-safe. The
+  // learner's profile still exists here (this is a disable/penalty/enable, not a
+  // wipe), so the nested write creates no ghost. Phase 5 drops the root write.
+  const payload = {
     ...status,
     reason,
     updatedBy: admin?.email || admin?.uid || '',
     updatedAt: serverTimestamp(),
-  }, { merge: true })
+  }
+  await setDoc(doc(db, 'users', uid, 'status', 'moderation'), payload, { merge: true })
+  // OLD PATH (Phase 5: remove).
+  await setDoc(doc(db, 'accountStatus', uid), payload, { merge: true })
   await writeAudit(admin, {
     action: status.disabled ? 'account.disable'
       : status.lockedUntil ? 'account.penalize'
@@ -221,11 +233,65 @@ async function deletePostTree(postRef, result = { r2: 0, errors: [] }) {
   await deleteDoc(postRef)
 }
 
+// Deterministic first pass: consume the deletion manifest
+// (users/{uid}/authored). Each row names a document this learner wrote into
+// someone else's subtree — a comment, a vote, a share, or an outgoing
+// notification — so we can delete exactly those without relying on
+// collection-group indexes, then repair the post-scoped counters by RECOUNTING
+// the surviving children. Follower/member counters are left to the dedicated
+// steps below (which decrement once) to avoid double-counting; manifest rows of
+// those types only delete their target document. Idempotent with steps 3–4,
+// which stay as a fallback for anything the manifest missed. See §4.2 of
+// FIRESTORE_RESTRUCTURE.md.
+async function deleteViaManifest(uid, result) {
+  try {
+    const snap = await getDocs(collection(db, 'users', uid, 'authored'))
+    const toRepair = new Map() // parentPath -> type
+    for (const m of snap.docs) {
+      const d = m.data() || {}
+      const path = d.path
+      const type = d.type || ''
+      const parentPath = d.parentPath
+      if (typeof path === 'string' && path) {
+        try { await deleteDoc(doc(db, path)) } catch { /* already gone */ }
+        if (type === 'comment') result.comments++
+        else if (type === 'vote' || type === 'commentVote') result.votes++
+      }
+      if (parentPath && ['comment', 'vote', 'commentVote', 'share'].includes(type)) {
+        toRepair.set(parentPath, type)
+      }
+      try { await deleteDoc(m.ref) } catch { /* ignore */ }
+    }
+
+    for (const [parentPath, type] of toRepair) {
+      const parentRef = doc(db, parentPath)
+      try {
+        if (type === 'comment') {
+          const left = await getDocs(collection(parentRef, 'comments'))
+          await updateDoc(parentRef, { commentCount: left.size })
+        } else if (type === 'share') {
+          const left = await getDocs(collection(parentRef, 'shares'))
+          await updateDoc(parentRef, { shareCount: left.size })
+        } else if (type === 'vote' || type === 'commentVote') {
+          const left = await getDocs(collection(parentRef, 'votes'))
+          let up = 0, down = 0
+          left.forEach((d) => { const dir = d.data()?.direction; if (dir === 'up') up++; else if (dir === 'down') down++ })
+          await updateDoc(parentRef, { upvoteCount: up, downvoteCount: down, score: up - down })
+        }
+      } catch { /* parent gone */ }
+    }
+  } catch (e) { result.errors.push('manifest: ' + e.message) }
+}
+
 export async function deleteAccountData(uid, admin, { label = '', reason = '' } = {}) {
   const result = {
     posts: 0, communities: 0, comments: 0, votes: 0,
     messages: 0, conversations: 0, r2: 0, errors: [],
   }
+
+  // 0. Manifest pass — deterministic cross-user cleanup (see above). Runs first
+  //    so the collection-group fallbacks in steps 3–4 have little left to do.
+  await deleteViaManifest(uid, result)
 
   // 1. Their own posts (+ subtrees + R2 media).
   try {
@@ -345,12 +411,17 @@ export async function deleteAccountData(uid, admin, { label = '', reason = '' } 
     }
   } catch (e) { result.errors.push('conversations: ' + e.message) }
 
-  // 8. Notifications inbox.
+  // 8. Notifications inbox — new nested path and old root path (Phase 4).
+  try { await deleteAll(collection(db, 'users', uid, 'notifications')) }
+  catch (e) { result.errors.push('notifications (nested): ' + e.message) }
+  // OLD PATH (Phase 5: remove).
   try { await deleteAll(collection(db, 'notifications', uid, 'items')) }
-  catch (e) { result.errors.push('notifications: ' + e.message) }
+  catch (e) { result.errors.push('notifications (root): ' + e.message) }
 
-  // 9. Progress doc.
-  try { await deleteDoc(doc(db, 'progress', uid)) }
+  // 9. Progress doc — lives at users/{uid}/progress/current (the restructure's
+  //    Phase 3 target). The old-root delete was removed once the database was
+  //    confirmed free of any pre-migration data to carry forward.
+  try { await deleteDoc(doc(db, 'users', uid, 'progress', 'current')) }
   catch (e) { result.errors.push('progress: ' + e.message) }
 
   // 10. The profile's own avatar/banner in R2 (while users/{uid} still exists),
@@ -366,6 +437,13 @@ export async function deleteAccountData(uid, admin, { label = '', reason = '' } 
   for (const sub of [
     'joinedCommunities', 'recentCommunities', 'followers', 'following',
     'hiddenPosts', 'blocked', 'blockedBy', 'devices',
+    // Restructure additions — the consolidated per-learner subcollections, so a
+    // wipe leaves no ghost subtree under users/{uid}. (progress + notifications
+    // were cleared in steps 8–9; re-sweeping is a harmless no-op. `status` is
+    // swept here rather than left behind — the wipe marker is written to the
+    // OLD accountStatus root below, which survives independently and so does not
+    // ghost the profile.)
+    'authored', 'private', 'progress', 'status', 'notifications',
   ]) {
     try { await deleteAll(collection(db, 'users', uid, sub)) }
     catch (e) { result.errors.push(`${sub}: ${e.message}`) }
@@ -377,12 +455,22 @@ export async function deleteAccountData(uid, admin, { label = '', reason = '' } 
     catch (e) { result.errors.push('profile: ' + e.message) }
   }
 
-  // 6. FREE the account (don't ban it), and stamp a wipe marker. Writing the
+  // 11. FREE the account (don't ban it), and stamp a wipe marker. Writing the
   //    doc WITHOUT merge overwrites any prior disable/penalty, so there is no
   //    block — the person can sign in again and start fresh. `wipedAt` is read
   //    by the app on next sign-in to also clear the on-device cache, so the
   //    reset holds even on the same phone. (No `disabled`/`lockedUntil` here,
   //    so this marker never blocks login.)
+  //
+  //    DELIBERATELY written to the OLD root accountStatus/{uid}, not the nested
+  //    users/{uid}/status/moderation: this marker must OUTLIVE the profile we
+  //    just deleted, and a doc under users/{uid} would leave the whole
+  //    users/{uid} document showing as a ghost (its only surviving child). The
+  //    root collection survives independently, and the app's status reads fall
+  //    back to it (new-first, old-fallback) precisely because a wiped account
+  //    has no nested doc. This is why the accountStatus root can't be fully
+  //    retired in Phase 5 without first giving the wipe marker another
+  //    always-surviving home. See §4.3.
   try {
     await setDoc(doc(db, 'accountStatus', uid), {
       wipedAt: serverTimestamp(),

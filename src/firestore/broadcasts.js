@@ -1,14 +1,21 @@
 import {
-  collection, addDoc, getDocs, query, where, orderBy, onSnapshot,
+  collection, addDoc, query, orderBy, onSnapshot,
   doc, deleteDoc, serverTimestamp, Timestamp,
 } from 'firebase/firestore'
 import { db } from '../firebase'
 import { writeAudit } from './moderation'
+import { fetchLearners } from './learners'
 
 // Announcements. Each broadcast is recorded in the `broadcasts` collection AND
-// fanned out into recipients' existing notification inboxes
-// (notifications/{uid}/items) so it shows up in-app with no mobile change — the
-// same schema NotificationRepository writes, with type "announcement".
+// fanned out into recipients' notification inboxes so it shows up in-app with
+// no mobile change — the same schema NotificationRepository writes, with type
+// "announcement".
+//
+// The inbox is migrating from notifications/{uid}/items to
+// users/{uid}/notifications (Phase 4). Per the plan, all writers target the new
+// nested path; the mobile app reads both paths merged, so an updated client sees
+// these. (A learner on a pre-Phase-4 build won't see new-path notifications
+// until they update — the accepted Phase 4 tradeoff.)
 
 export const AUDIENCES = [
   { value: 'all', label: 'All learners' },
@@ -19,10 +26,12 @@ export const AUDIENCES = [
 ]
 
 async function recipientUids(audience) {
-  const snap = await getDocs(collection(db, 'progress'))
-  return snap.docs
-    .filter((d) => audience === 'all' || (d.data().rank || '') === audience)
-    .map((d) => d.id)
+  // fetchLearners() reads the `progress` collection group and de-dupes by uid,
+  // so this targets learners correctly across the Phase 3 migration window.
+  const learners = await fetchLearners()
+  return learners
+    .filter((l) => audience === 'all' || (l.rank || '') === audience)
+    .map((l) => l.uid)
 }
 
 /**
@@ -46,7 +55,7 @@ export async function createBroadcast(admin, { title, body, audience }) {
   let delivered = 0
   await Promise.all(uids.map(async (uid) => {
     try {
-      await addDoc(collection(db, 'notifications', uid, 'items'), {
+      await addDoc(collection(db, 'users', uid, 'notifications'), {
         type: 'announcement',
         fromUserId: admin.uid,
         fromUserName: title,

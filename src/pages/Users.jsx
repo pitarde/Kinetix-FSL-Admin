@@ -24,6 +24,13 @@ const STATUS_FILTERS = [
 function useAccountStatuses() {
   const [map, setMap] = useState({})
   useEffect(() => {
+    // Deliberately the ROOT accountStatus collection, not the nested
+    // users/{uid}/status/moderation. It is the superset during the migration:
+    // setAccountStatus dual-writes disable/penalty state to both, but the
+    // account-wipe marker (purgeAuth/wipedAt) is written ONLY to the root so it
+    // survives the profile deletion without ghosting users/{uid} (see
+    // moderation.js and §4.3). This overview must see wiped accounts too, so it
+    // keeps reading the root — which is why the root collection is retained.
     return onSnapshot(collection(db, 'accountStatus'), (snap) => {
       const m = {}
       snap.docs.forEach((d) => { m[d.id] = d.data() })

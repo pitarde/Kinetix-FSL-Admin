@@ -1,11 +1,21 @@
-import { collection, getDocs, onSnapshot } from 'firebase/firestore'
+import { collectionGroup, getDocs, onSnapshot } from 'firebase/firestore'
 import { db } from '../firebase'
 import { TOTAL_SIGNS } from './signCatalog'
 
-// One learner = one document in the `progress/{uid}` collection, which the
-// mobile app mirrors from local state (ProgressRepository.buildSyncDocument).
-// Each doc carries flat summary fields plus an `activityJson` blob holding the
-// full per-day / per-category / per-sign event log the analytics is built from.
+// One learner = one progress document, which the mobile app mirrors from local
+// state (ProgressRepository.buildSyncDocument). Each doc carries flat summary
+// fields plus an `activityJson` blob holding the full per-day / per-category /
+// per-sign event log the analytics is built from.
+//
+// Progress now lives ONLY at `users/{uid}/progress/current` (the restructure's
+// Phase 3 target — the old root `progress/{uid}` write/read was retired once
+// the database was confirmed to hold no pre-migration data). We still read the
+// `progress` COLLECTION GROUP rather than a plain collection query, because
+// that's the only way to query a subcollection across every user at once — this
+// isn't migration-transitional code, it's the permanent shape. The de-dupe-by-
+// uid step below is now a no-op in practice (nothing writes the old root path
+// anymore) but stays as cheap insurance. Backed by the
+// `/{path=**}/progress/{docId}` admin read rule in firestore.rules.
 
 const MS_PER_DAY = 86_400_000
 
@@ -89,17 +99,47 @@ export function normalizeLearner(id, data) {
   }
 }
 
+/**
+ * The learner uid behind one progress doc, resolved for either location:
+ *   • root  progress/{uid}                     → the doc id IS the uid
+ *   • nested users/{uid}/progress/current      → grandparent id is the uid
+ */
+function progressUid(docSnap) {
+  if (docSnap.id === 'current' && docSnap.ref.parent.parent) {
+    return docSnap.ref.parent.parent.id
+  }
+  return docSnap.id
+}
+
+/**
+ * De-duplicates a collection-group snapshot by learner uid, preferring the
+ * nested (migration-target) copy when a learner has both during the dual-write
+ * window, so a learner is never counted twice.
+ */
+function dedupeLearners(docs) {
+  const byUid = new Map()
+  for (const d of docs) {
+    const uid = progressUid(d)
+    const isNested = d.id === 'current'
+    const existing = byUid.get(uid)
+    if (!existing || (isNested && !existing.isNested)) {
+      byUid.set(uid, { isNested, learner: normalizeLearner(uid, d.data()) })
+    }
+  }
+  return [...byUid.values()].map((v) => v.learner)
+}
+
 /** One-shot fetch of every learner. */
 export async function fetchLearners() {
-  const snap = await getDocs(collection(db, 'progress'))
-  return snap.docs.map((d) => normalizeLearner(d.id, d.data()))
+  const snap = await getDocs(collectionGroup(db, 'progress'))
+  return dedupeLearners(snap.docs)
 }
 
 /** Live subscription; returns an unsubscribe fn. Calls back with (learners, error). */
 export function subscribeLearners(onData, onError) {
   return onSnapshot(
-    collection(db, 'progress'),
-    (snap) => onData(snap.docs.map((d) => normalizeLearner(d.id, d.data()))),
+    collectionGroup(db, 'progress'),
+    (snap) => onData(dedupeLearners(snap.docs)),
     (err) => onError?.(err),
   )
 }
