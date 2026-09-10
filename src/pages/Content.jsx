@@ -4,18 +4,39 @@ import { CATEGORIES } from '../firestore/signCatalog'
 import { subscribeContentOverrides, setModuleEnabled } from '../firestore/content'
 import { computeAnalytics } from '../firestore/analytics'
 import { useLearners } from '../hooks/useLearners'
-import { Card, PageHeader, Badge, Btn, useToast } from '../components/ui'
+import { Card, PageHeader, Badge, Btn, Spinner, useToast } from '../components/ui'
 import { moduleIcon } from '../assets/icons'
 import { pct } from '../lib/format'
+
+// Kept at module scope so leaving this page and coming back re-uses the last
+// overrides snapshot instead of starting from `{}` — otherwise every hidden
+// module flashes as "Live / Hide module" for the frame before Firestore
+// answers, every single time the screen is opened.
+let cachedOverrides = {}
+let cachedOverridesLoaded = false
 
 export default function Content() {
   const { user: admin } = useAuth()
   const toast = useToast()
   const { learners } = useLearners()
-  const [overrides, setOverrides] = useState({})
-  const [busy, setBusy] = useState(null)
+  const [overrides, setOverrides] = useState(cachedOverrides)
+  // Gates the module grid until the real override state is known, so a hidden
+  // module is never briefly painted as live (or vice-versa) on first load.
+  const [loaded, setLoaded] = useState(cachedOverridesLoaded)
 
-  useEffect(() => subscribeContentOverrides(setOverrides, () => setOverrides({})), [])
+  useEffect(() => subscribeContentOverrides(
+    (map) => {
+      cachedOverrides = map
+      cachedOverridesLoaded = true
+      setOverrides(map)
+      setLoaded(true)
+    },
+    () => {
+      cachedOverridesLoaded = true
+      setOverrides({})
+      setLoaded(true)
+    },
+  ), [])
 
   // Surface each module's live accuracy so the admin can spot which need a
   // better demo video — the "needs attention" signal for content work.
@@ -51,6 +72,7 @@ export default function Content() {
         </p>
       </Card>
 
+      {!loaded ? <Spinner label="Loading modules…" /> : (
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {CATEGORIES.map((cat) => {
           const disabled = !!overrides[cat.id]?.disabled
@@ -97,6 +119,7 @@ export default function Content() {
           )
         })}
       </div>
+      )}
     </div>
   )
 }

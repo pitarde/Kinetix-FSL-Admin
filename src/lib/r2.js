@@ -63,6 +63,24 @@ export async function deleteR2Objects(owner, keys) {
   }
 }
 
+/**
+ * A stored media URL, rewritten to load through the upload Worker.
+ *
+ * The bucket's own `pub-*.r2.dev` hostname is filtered on some networks and is
+ * dev-only anyway; newer uploads already store the Worker URL. Mirrors
+ * `throughWorker()` in web/worker.js so a legacy `.r2.dev` link still plays.
+ */
+export function mediaSrc(url) {
+  if (!url || typeof url !== 'string') return url
+  try {
+    const parsed = new URL(url)
+    if (!parsed.hostname.endsWith('.r2.dev')) return url
+    return `${WORKER_URL}/f/${parsed.pathname.replace(/^\/+/, '')}`
+  } catch {
+    return url
+  }
+}
+
 /** Every R2 key a post owns: its own media plus any image on its comments. */
 export function postStorageKeys(postData, commentDatas = []) {
   const urls = [postData?.imageUrl, postData?.videoUrl, postData?.previewUrl]
